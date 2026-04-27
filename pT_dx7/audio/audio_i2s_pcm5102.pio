@@ -1,0 +1,94 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+
+; picoTracker RP2040 audio output path.
+;
+; The original picoTracker board uses a PCM5102-class DAC but drives it with a
+; 32-bit-per-channel I2S frame, while the synth engine still provides 16-bit
+; samples packed as:
+;
+; | 31   :   16 | 15   :    0 |
+; | sample ws=0 | sample ws=1 |
+;
+; This program sign-extends each 16-bit sample at the front of the channel word
+; and back-fills trailing zeros so the DAC sees the framing it expects.
+
+.program audio_i2s_pcm5102
+.side_set 2
+
+.define DATA_LOOP_COUNT 13
+.define OFFSET_COUNT 6
+.define BACKFILL_COUNT 7
+
+                            ;      /--- LRCLK
+                            ;      |/-- BCLK
+bitloop1:                   ;      ||
+    out pins, 1             side 0b10
+    jmp x-- bitloop1        side 0b11
+
+    out pins, 1             side 0b10
+    set y, BACKFILL_COUNT   side 0b11
+
+backfill1:
+    set pins, 0             side 0b10
+    jmp y-- backfill1       side 0b11
+
+    set pins, 0             side 0b00
+    set x, DATA_LOOP_COUNT  side 0b01
+
+    out pins, 1             side 0b00
+    set y, OFFSET_COUNT     side 0b01
+
+padloop1:
+    nop                     side 0b00
+    jmp y-- padloop1        side 0b01
+
+bitloop0:
+    out pins, 1             side 0b00
+    jmp x-- bitloop0        side 0b01
+
+    out pins, 1             side 0b00
+    set y, BACKFILL_COUNT   side 0b01
+
+backfill0:
+    set pins, 0             side 0b00
+    jmp y-- backfill0       side 0b01
+
+    set pins, 0             side 0b10
+
+public entry_point:
+    set x, DATA_LOOP_COUNT  side 0b11
+
+    out pins, 1             side 0b10
+    set y, OFFSET_COUNT     side 0b11
+
+padloop0:
+    nop                     side 0b10
+    jmp y-- padloop0        side 0b11
+
+% c-sdk {
+
+static inline void audio_i2s_pcm5102_program_init(PIO pio, uint sm, uint offset,
+                                                  uint data_pin,
+                                                  uint clock_pin_base) {
+    pio_sm_config sm_config = audio_i2s_pcm5102_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&sm_config, data_pin, 1);
+    sm_config_set_set_pins(&sm_config, data_pin, 1);
+    sm_config_set_sideset_pins(&sm_config, clock_pin_base);
+    sm_config_set_out_shift(&sm_config, false, true, 32);
+
+    pio_sm_init(pio, sm, offset, &sm_config);
+
+    uint pin_mask = (1u << data_pin) | (3u << clock_pin_base);
+    pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+    pio_sm_set_pins(pio, sm, 0);
+
+    pio_sm_exec(pio, sm,
+                pio_encode_jmp(offset + audio_i2s_pcm5102_offset_entry_point));
+}
+
+%}

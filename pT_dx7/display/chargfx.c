@@ -1,0 +1,303 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Copyright (c) 2024 xiphonics, inc.
+ *
+ * This file is part of the picoTracker firmware
+ */
+
+#include "chargfx.h"
+#include "font.h"
+#include "hardware/spi.h"
+#include "ili9341.h"
+#include "pico/stdlib.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Character graphics mode */
+
+#define SWAP_BYTES(color) ((uint16_t)(color >> 8) | (uint16_t)(color << 8))
+
+static chargfx_color_t screen_bg_color = CHARGFX_BG;
+static chargfx_color_t screen_fg_color = CHARGFX_NORMAL;
+static int cursor_x = 0;
+static int cursor_y = 0;
+static uint8_t screen[TEXT_HEIGHT * TEXT_WIDTH] = {0};
+static uint8_t colors[TEXT_HEIGHT * TEXT_WIDTH] = {0};
+static uint8_t font_indices[TEXT_HEIGHT * TEXT_WIDTH] = {0};
+static uint16_t buffer[CHAR_HEIGHT * CHAR_WIDTH * BUFFER_CHARS] = {0};
+
+static uint8_t ui_font_index = 0;
+
+// Using a bit array in order to save memory, there is a slight performance
+// hit in doing so vs a bool array
+static uint8_t changed[TEXT_HEIGHT * TEXT_WIDTH / 8] = {0};
+#define SetBit(A, k) (A[(k) / 8] |= (1 << ((k) % 8)))
+#define ClearBit(A, k) (A[(k) / 8] &= ~(1 << ((k) % 8)))
+#define TestBit(A, k) (A[(k) / 8] & (1 << ((k) % 8)))
+
+#define DISPLAY_WIDTH ILI9341_TFTHEIGHT
+#define DISPLAY_HEIGHT ILI9341_TFTWIDTH
+
+// Default palette, can be redefined
+static uint16_t palette[16] = {
+    SWAP_BYTES(0x0000), SWAP_BYTES(0x49E5), SWAP_BYTES(0xB926),
+    SWAP_BYTES(0xE371), SWAP_BYTES(0x9CF3), SWAP_BYTES(0xA324),
+    SWAP_BYTES(0xEC46), SWAP_BYTES(0xF70D), SWAP_BYTES(0xffff),
+    SWAP_BYTES(0x1926), SWAP_BYTES(0x2A49), SWAP_BYTES(0x4443),
+    SWAP_BYTES(0xA664), SWAP_BYTES(0x02B0), SWAP_BYTES(0x351E),
+    SWAP_BYTES(0xB6FD)};
+
+static inline void chargfx_set_window(uint16_t x, uint16_t y, uint16_t width,
+                                      uint16_t height) {
+  uint16_t panel_column = DISPLAY_HEIGHT - y - height;
+  uint16_t panel_row = x;
+
+  ili9341_set_command(ILI9341_CASET);
+  ili9341_command_param16(panel_column);
+  ili9341_command_param16(panel_column + height - 1);
+
+  ili9341_set_command(ILI9341_PASET);
+  ili9341_command_param16(panel_row);
+  ili9341_command_param16(panel_row + width - 1);
+}
+
+void chargfx_clear(chargfx_color_t color) {
+  int size = TEXT_WIDTH * TEXT_HEIGHT;
+  memset(screen, 0, size);
+  memset(colors, color, size);
+  memset(font_indices, 0, size);
+  chargfx_set_cursor(0, 0);
+  chargfx_draw_screen();
+}
+
+void chargfx_set_foreground(chargfx_color_t color) { screen_fg_color = color; }
+
+void chargfx_set_background(chargfx_color_t color) { screen_bg_color = color; }
+
+void chargfx_set_font_index(uint8_t idx) { ui_font_index = idx; }
+
+void chargfx_set_cursor(uint8_t x, uint8_t y) {
+  cursor_x = x;
+  cursor_y = y;
+}
+
+uint8_t chargfx_get_cursor_x() { return cursor_x; }
+
+uint8_t chargfx_get_cursor_y() { return cursor_y; }
+
+void chargfx_putc(char c, bool invert) {
+  const unsigned char glyph = (unsigned char)c;
+  int idx = cursor_y * TEXT_WIDTH + cursor_x;
+  uint8_t next_color;
+
+  if (glyph < 32u) {
+    return;
+  }
+
+  next_color = invert ? ((screen_bg_color & 0xf) << 4) | (screen_fg_color & 0xf)
+                      : ((screen_fg_color & 0xf) << 4) |
+                            (screen_bg_color & 0xf);
+
+  if (screen[idx] != (uint8_t)(glyph - 32u) || colors[idx] != next_color ||
+      font_indices[idx] != ui_font_index) {
+    screen[idx] = (uint8_t)(glyph - 32u);
+    colors[idx] = next_color;
+    font_indices[idx] = ui_font_index;
+    SetBit(changed, idx);
+  }
+}
+
+void chargfx_print(const char *str, bool invert) {
+  char c;
+  while ((c = *str++)) {
+    chargfx_putc(c, invert);
+  }
+}
+
+void chargfx_write(const char *str, int len, bool invert) {
+  for (int i = 0; i < len; i++) {
+    chargfx_putc(*str++, invert);
+  }
+}
+
+void chargfx_draw_region(uint8_t x, uint8_t y, uint8_t width, uint8_t height) {
+
+  int remainder = height;
+  while (remainder) {
+    int sub_height = (remainder > BUFFER_CHARS) ? BUFFER_CHARS : remainder;
+    int sub_y = y + height - remainder;
+    remainder -= sub_height;
+    chargfx_draw_sub_region(x, sub_y, width, sub_height);
+  }
+}
+
+void chargfx_fill_rect(uint8_t color_index, uint16_t x, uint16_t y,
+                       uint16_t width, uint16_t height) {
+  uint16_t color = palette[color_index];
+
+  if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT) {
+    return;
+  }
+  if (x + width > DISPLAY_WIDTH) {
+    width = DISPLAY_WIDTH - x;
+  }
+  if (y + height > DISPLAY_HEIGHT) {
+    height = DISPLAY_HEIGHT - y;
+  }
+
+  chargfx_set_window(x, y, width, height);
+  ili9341_set_command(ILI9341_RAMWR);
+  ili9341_start_writing();
+
+  for (uint16_t i = 0; i < width; i++) {
+    buffer[i] = color;
+  }
+
+  for (uint16_t i = 0; i < height; i++) {
+    ili9341_write_data_continuous(buffer, width * sizeof(uint16_t));
+  }
+
+  ili9341_stop_writing();
+}
+
+inline void chargfx_draw_sub_region(uint8_t x, uint8_t y, uint8_t width,
+                                    uint8_t height) {
+  assert(height <= BUFFER_CHARS);
+
+  uint16_t screen_x = x * CHAR_WIDTH;
+  uint16_t screen_y = (TEXT_HEIGHT - height - y) * CHAR_HEIGHT;
+  uint16_t screen_width = width * CHAR_WIDTH;
+  uint16_t screen_height = height * CHAR_HEIGHT;
+
+  chargfx_set_window(screen_x, screen_y, screen_width, screen_height);
+  ili9341_set_command(ILI9341_RAMWR);
+
+  ili9341_start_writing();
+
+  const size_t font_count = sizeof(fonts) / sizeof(fonts[0]);
+
+  for (int page = x; page < x + width; page++) {
+    // create one column of screen information
+    uint16_t *buffer_idx = buffer;
+
+    for (int bit = CHAR_WIDTH - 1; bit >= 0; bit--) {
+      uint16_t mask = 1 << (CHAR_WIDTH - 1 - bit);
+      for (int col = y + height - 1; col >= y; col--) {
+        int16_t idx = col * TEXT_WIDTH + page;
+        uint8_t character = screen[idx];
+        uint16_t fg_color = palette[colors[idx] >> 4];
+        uint16_t bg_color = palette[colors[idx] & 0xf];
+        uint8_t font_index = font_indices[idx];
+        const font_t *font = fonts[font_index < font_count ? font_index : 0u];
+
+        const uint16_t *pixel_data =
+            (character < 96) ? (*font)[character]
+                             : FONT_SPECIAL_CHARACTERS_BITMAP[character - 96];
+
+        // draw the character into the buffer
+        for (int j = CHAR_HEIGHT - 1; j >= 0; j--) {
+          uint16_t pix = pixel_data[j];
+          *buffer_idx++ = (pix & mask) ? fg_color : bg_color;
+        }
+      }
+    }
+    ili9341_write_data_continuous(buffer,
+                                  CHAR_WIDTH * screen_height * sizeof(int16_t));
+  }
+  ili9341_stop_writing();
+}
+
+void chargfx_draw_changed() {
+  for (int idx = 0; idx < TEXT_HEIGHT * TEXT_WIDTH; idx++) {
+    if (TestBit(changed, idx)) {
+      ClearBit(changed, idx);
+      // check adjacent in order to find bigger rectangle
+      uint16_t y = idx / TEXT_WIDTH;
+      uint16_t x = idx - (TEXT_WIDTH * y);
+
+      int height = 1;
+      // first pass tests the height
+      for (int probe_y = y + 1; probe_y < TEXT_HEIGHT; probe_y++) {
+        int probe_idx = probe_y * TEXT_WIDTH + x;
+        if (TestBit(changed, probe_idx)) {
+          ClearBit(changed, probe_idx);
+          height++;
+          continue;
+        }
+        break;
+      }
+
+      int16_t width = 1;
+      // having the height, we can test every subsequent column
+      for (int probe_x = x + 1; probe_x < TEXT_WIDTH; probe_x++) {
+        for (int probe_y = y; probe_y < y + height; probe_y++) {
+          // if we don't get to max height, then abort
+          int probe_idx = probe_y * TEXT_WIDTH + probe_x;
+          if (!TestBit(changed, probe_idx)) {
+            // undo last column
+            for (int undo_y = y; undo_y < probe_y; undo_y++) {
+              SetBit(changed, undo_y * TEXT_WIDTH + probe_x);
+            }
+            goto end;
+          }
+          ClearBit(changed, probe_idx);
+        }
+        width++;
+      }
+    end:
+      chargfx_draw_region(x, y, width, height);
+    }
+  }
+}
+
+void chargfx_draw_changed_rows() {
+  for (int y = 0; y < TEXT_HEIGHT; ++y) {
+    for (int x = 0; x < TEXT_WIDTH;) {
+      const int idx = y * TEXT_WIDTH + x;
+
+      if (!TestBit(changed, idx)) {
+        ++x;
+        continue;
+      }
+
+      int width = 1;
+      ClearBit(changed, idx);
+      while ((x + width) < TEXT_WIDTH) {
+        const int run_idx = y * TEXT_WIDTH + x + width;
+
+        if (!TestBit(changed, run_idx)) {
+          break;
+        }
+        ClearBit(changed, run_idx);
+        ++width;
+      }
+
+      chargfx_draw_region((uint8_t)x, (uint8_t)y, (uint8_t)width, 1u);
+      x += width;
+    }
+  }
+}
+
+void chargfx_draw_changed_simple() {
+  // This method is better (faster) for fewer characters changed
+  for (int idx = 0; idx < TEXT_HEIGHT * TEXT_WIDTH; idx++) {
+    if (TestBit(changed, idx)) {
+      ClearBit(changed, idx);
+      uint16_t y = idx / TEXT_WIDTH;
+      uint16_t x = idx - (TEXT_WIDTH * y);
+      chargfx_draw_region(x, y, 1, 1);
+    }
+  }
+}
+
+void chargfx_draw_screen() {
+  // draw the whole screen
+  chargfx_draw_region(0, 0, TEXT_WIDTH, TEXT_HEIGHT);
+}
+
+void chargfx_set_palette_color(int idx, uint16_t rgb565_color) {
+  palette[idx] = SWAP_BYTES(rgb565_color);
+}
+
+void chargfx_init() { ili9341_init(); }

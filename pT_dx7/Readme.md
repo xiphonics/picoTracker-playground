@@ -45,3 +45,35 @@ The LCD shows the current patch, master level, voice level, preview note,
 preview gate state, USB MIDI state, and battery status.
 
 Incoming MIDI program change messages update the currently selected patch.
+
+## MIDI Implementation
+
+### Transports
+
+| Transport | Details |
+|---|---|
+| **USB MIDI** | Device mode — connects to a host |
+| **UART (TRS)** | Standard 5-pin MIDI IN |
+
+### Received (MIDI IN) Messages
+
+| Message | Channel | Behavior |
+|---|---|---|
+| **Note On** | All (1–16) | Triggers a voice. Velocity 0 is treated as Note Off. |
+| **Note Off** | All (1–16) | Releases the voice. |
+| **Program Change** | All (1–16) | Selects a patch (wrapped to the number of patches in the loaded bank). |
+| **CC #0** (Bank Select MSB) | All (1–16) | Combined with CC #32 to select a ROM bank file from `/dx7patches`. |
+| **CC #32** (Bank Select LSB) | All (1–16) | Combined with CC #0 to select a ROM bank file (0–16383). |
+| **CC #7** (Volume) | All (1–16) | Sets the master output level (0–127 → 0–255). |
+| **CC #11** (Expression) | All (1–16) | Sets the internal voice gain (0–127 → 0–255). |
+| **CC #120** (All Notes Off) | Omni | Kills all active voices (panic). |
+| **CC #123** (All Sound Off) | Omni | Kills all active voices (panic). |
+| **MIDI Stop** | Omni | Stops playback and kills all voices. |
+| **MIDI Reset** (0xFF) | Omni | Stops playback and kills all voices. |
+
+### Notes
+
+- **Running status** is supported for all standard short messages.
+- **SysEx** (0xF0 … 0xF7) is parsed and queued but not dispatched as a MIDI IN message. SysEx files are loaded from the SD card (`/dx7patches/*.syx`).
+- All other MIDI messages (MTC, Song Position, Tune Request, Active Sensing, etc.) are silently ignored.
+- When USB MIDI is disconnected or reconnected, all voices are automatically killed to prevent stuck notes.

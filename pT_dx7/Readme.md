@@ -5,6 +5,7 @@ Standalone DX7 firmware for the original RP2040-based picoTracker hardware.
 ## Build
 
 ```sh
+cd ..
 PICO_SDK_PATH=/path/to/pico-sdk cmake -S pT_dx7 -B pT_dx7/build -DPICO_BOARD=pico
 cmake --build pT_dx7/build -j
 ```

@@ -11,6 +11,7 @@ endif()
 project("Chocolate Doom" VERSION 3.0.0 LANGUAGES C CXX)
 enable_language(CXX)
 set(CMAKE_CXX_STANDARD 14)
+option(BUILD_WHD_GEN_ONLY "Build only the WHD generator tool" OFF)
 
 if (PICO_SDK_PATH)
     # we are using git@github.com:liamfraser/tinyusb.git as it has some RP2040 fixes that aren't upstreamed yet
@@ -25,6 +26,12 @@ if (PICO_SDK_PATH)
 endif()
 
 set(CMAKE_C_STANDARD 11)
+
+if (BUILD_WHD_GEN_ONLY)
+    add_subdirectory(src/adpcm-xq)
+    add_subdirectory(src/whd_gen)
+    return()
+endif()
 
 # Autotools variables
 set(top_srcdir ${CMAKE_CURRENT_SOURCE_DIR})

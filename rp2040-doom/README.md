@@ -16,6 +16,56 @@ This chocolate-doom commit that the code is branched off can be found in the `up
 
 The original Chocolate Doom README is [here](README-chocolate.md).
 
+## picoTracker Port
+
+The `picotracker` target runs on picoTracker hardware with the LCD, GPIO buttons, and I2S audio path enabled.
+
+Current keymap:
+
+* D-pad: move / menu navigation
+* `ENTER`: fire in-game, menu select / confirm
+* `EDIT`: run
+* `ALT`: use / open
+* `NAV`: automap
+* `PLAY`: pause / menu / escape
+
+The picoTracker build expects a non-super-tiny `.whd` image in upper flash at `0x10048000`. Generate it from your IWAD with:
+
+```bash
+/home/maks/work/xiphonics/rp2040-doom/build-host-whd/src/whd_gen/whd_gen \
+  /absolute/path/to/DOOM.WAD \
+  /home/maks/work/xiphonics/rp2040-doom/doom.whd \
+  -no-super-tiny
+```
+
+To write that `.whd` over SWD using a PicoProbe/OpenOCD setup:
+
+1. Start OpenOCD:
+
+```bash
+/home/maks/apps/openocd/bin/openocd \
+  -s /home/maks/apps/openocd/share/openocd/scripts \
+  -f interface/cmsis-dap.cfg \
+  -f target/rp2040.cfg \
+  -c "adapter speed 5000"
+```
+
+2. In another terminal, write and verify the WAD image:
+
+```bash
+gdb \
+  -ex "target extended-remote :3333" \
+  -ex "monitor reset init" \
+  -ex "monitor flash write_image erase /home/maks/work/xiphonics/rp2040-doom/doom.whd 0x10048000 bin" \
+  -ex "monitor verify_image /home/maks/work/xiphonics/rp2040-doom/doom.whd 0x10048000 bin" \
+  -ex "monitor reset run" \
+  -ex "detach" \
+  -ex "quit" \
+  /home/maks/work/xiphonics/rp2040-doom/build-picotracker/src/doom_tiny_picotracker.elf
+```
+
+The debugger-loaded ELF does not normally overwrite that upper flash region, so you only need to re-write the `.whd` if you erase or reflash the whole device.
+
 ## Code State
 
 Thus far, the focus has been entirely on getting RP2040 Doom running. Not a lot of time has been 
@@ -246,4 +296,3 @@ and the design files zipped [here](https://datasheets.raspberrypi.com/rp2040/VGA
 * New RP2040 Doom specific code not implementing existing chocolate-doom interfaces is licensed BSD-3.
 * ADPCM-XA is unmodified and is licensed BSD-3.
 * Modified emu8950 derived code retains its MIT license.
-

@@ -43,14 +43,21 @@
 #include "w_wad.h"
 #include "z_zone.h"
 
+#if PICOTRACKER
+#include "hardware/spi.h"
+#include "hardware/dma.h"
+#include "hardware/pwm.h"
+#include "hardware/clocks.h"
+#else
 #include "pico/scanvideo.h"
 #include "pico/scanvideo/composable_scanline.h"
+#include "video_doom.pio.h"
+#endif
 #include "pico/multicore.h"
 #include "pico/sync.h"
 #include "pico/time.h"
 #include "hardware/gpio.h"
 #include "picodoom.h"
-#include "video_doom.pio.h"
 #include "image_decoder.h"
 #if PICO_ON_DEVICE
 #include "hardware/dma.h"
@@ -58,7 +65,36 @@
 #endif
 
 #define YELLOW_SUBMARINE 0
+#if PICOTRACKER
+// picoTracker ST7789 LCD on SPI1
+#define LCD_SPI        spi1
+#define LCD_CS_PIN     20
+#define LCD_DC_PIN     21
+#define LCD_RST_PIN    22
+#define LCD_BL_PIN     23
+#define LCD_SCK_PIN    26
+#define LCD_MOSI_PIN   27
+#define LCD_WIDTH      320
+#define LCD_HEIGHT     240
+#define LCD_LETTERBOX  ((LCD_HEIGHT - SCREENHEIGHT) / 2)   // 20 rows top & bottom
+
+// ST7789 expects big-endian RGB565; store palette byte-swapped so 8-bit DMA
+// sends bytes in the correct order (high byte first).
+#undef PICO_SCANVIDEO_PIXEL_FROM_RGB8
+#define PICO_SCANVIDEO_PIXEL_FROM_RGB8(r, g, b) \
+    __builtin_bswap16((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
+
+static int lcd_dma_channel;
+// Double-buffered line scratch: while DMA sends one line the CPU converts the next
+static uint32_t __aligned(4) lcd_line_buf[2][SCREENWIDTH / 2];
+
+#define PICOTRACKER_LCD_TEST_PATTERN 0
+#define PICOTRACKER_LCD_DEBUG_RAW_FB 0
+
+#define SUPPORT_TEXT 0
+#else
 #define SUPPORT_TEXT 1
+#endif
 #if SUPPORT_TEXT
 typedef struct __packed {
     const char * const name;
@@ -103,8 +139,6 @@ static const patch_t *stbar;
 
 volatile uint8_t interp_in_use;
 
-#define USE_1280x1024x60 1
-
 // display has been set up?
 
 static boolean initialized = false;
@@ -136,10 +170,15 @@ static int8_t next_pal=-1;
 semaphore_t render_frame_ready, display_frame_freed;
 semaphore_t core1_launch;
 
+#if !PICOTRACKER
+#define USE_1280x1024x60 1
+
+#if SUPPORT_TEXT
 uint8_t *text_screen_data;
 static uint32_t *text_scanline_buffer_start;
 static uint8_t *text_screen_cpy;
 static uint8_t *text_font_cpy;
+#endif
 
 #if USE_1280x1024x60
 //static uint32_t missing_scanline_data[] = {
@@ -241,6 +280,7 @@ const scanvideo_mode_t vga_mode_320x200_60 =
 
 #define VGA_MODE vga_mode_320x200_60
 #endif
+#endif // !PICOTRACKER
 
 #if USE_INTERP
 static interp_hw_save_t interp0_save, interp1_save;
@@ -335,7 +375,9 @@ uint8_t *next_video_scroll;
 uint8_t *video_scroll;
 #endif
 volatile uint8_t wipe_min;
+#if !PICOTRACKER
 uint32_t *saved_scanline_buffer_ptrs[PICO_SCANVIDEO_SCANLINE_BUFFER_COUNT];
+#endif
 
 #pragma GCC push_options
 #if PICO_ON_DEVICE
@@ -980,6 +1022,7 @@ void __no_inline_not_in_flash_func(new_frame_stuff)() {
     }
 }
 
+#if !PICOTRACKER
 void __scratch_x("scanlines") fill_scanlines() {
 #if SUPPORT_TEXT
     struct scanvideo_scanline_buffer *buffer = scanvideo_begin_scanline_generation_linked(display_video_type == VIDEO_TYPE_TEXT ? 2 : 1, false);
@@ -1069,7 +1112,6 @@ void __scratch_x("scanlines") fill_scanlines() {
     }
 #endif
 }
-#pragma GCC pop_options
 
 #if PICO_ON_DEVICE
 #define LOW_PRIO_IRQ 31
@@ -1114,8 +1156,335 @@ static void core1() {
 #endif
     }
 }
+#endif // !PICOTRACKER
+#pragma GCC pop_options
 
-#if PICO_RP2350
+// ============================================================
+// picoTracker ST7789 display driver
+// ============================================================
+#if PICOTRACKER
+
+static void lcd_cmd(uint8_t cmd) {
+    gpio_put(LCD_DC_PIN, 0);
+    gpio_put(LCD_CS_PIN, 0);
+    spi_write_blocking(LCD_SPI, &cmd, 1);
+    gpio_put(LCD_CS_PIN, 1);
+}
+
+static void lcd_data(const uint8_t *data, size_t len) {
+    gpio_put(LCD_DC_PIN, 1);
+    gpio_put(LCD_CS_PIN, 0);
+    spi_write_blocking(LCD_SPI, data, len);
+    gpio_put(LCD_CS_PIN, 1);
+}
+
+static void lcd_data_byte(uint8_t b) { lcd_data(&b, 1); }
+
+static void fill_lcd_test_pattern_line(uint16_t *dest, int y) {
+    static const uint16_t colors[] = {
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0x00, 0x00),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0x80, 0x00),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xff, 0x00),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x00, 0xff, 0x00),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x00, 0x80, 0xff),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x00, 0x00, 0xff),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x80, 0x00, 0xff),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xff, 0xff),
+    };
+    int band_height = MAX(1, LCD_HEIGHT / (int)count_of(colors));
+    int color_index = MIN((int)count_of(colors) - 1, y / band_height);
+
+    for (int x = 0; x < SCREENWIDTH; ++x) {
+        uint16_t color = colors[color_index];
+        if ((x / 20) & 1) {
+            color ^= PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x20, 0x20, 0x20);
+        }
+        dest[x] = color;
+    }
+}
+
+static void fill_lcd_raw_framebuffer_line(uint16_t *dest, int scanline) {
+    static const uint16_t mode_colors[] = {
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x20, 0x20, 0x20),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xff, 0x00),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x00, 0xff, 0xff),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x00, 0xff, 0x00),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0x00, 0x80, 0xff),
+            PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0x00, 0xff),
+    };
+
+    if (scanline < 12) {
+        uint16_t left = mode_colors[display_video_type < count_of(mode_colors) ? display_video_type : 0];
+        uint16_t right = mode_colors[next_video_type < count_of(mode_colors) ? next_video_type : 0];
+        for (int x = 0; x < SCREENWIDTH; ++x) {
+            dest[x] = x < (SCREENWIDTH / 2) ? left : right;
+        }
+        return;
+    }
+
+    if (scanline < (LCD_HEIGHT / 2)) {
+        int y = (scanline - 12) * MAIN_VIEWHEIGHT / ((LCD_HEIGHT / 2) - 12);
+        const uint8_t *src = frame_buffer[0] + y * SCREENWIDTH;
+        for (int x = 0; x < SCREENWIDTH; ++x) {
+            uint8_t v = src[x];
+            dest[x] = PICO_SCANVIDEO_PIXEL_FROM_RGB8(v, v, v);
+        }
+        return;
+    }
+
+    int y = (scanline - (LCD_HEIGHT / 2)) * MAIN_VIEWHEIGHT / (LCD_HEIGHT - (LCD_HEIGHT / 2));
+    const uint8_t *src = frame_buffer[1] + y * SCREENWIDTH;
+    for (int x = 0; x < SCREENWIDTH; ++x) {
+        uint8_t v = src[x];
+        dest[x] = PICO_SCANVIDEO_PIXEL_FROM_RGB8(v, v, v);
+    }
+}
+
+static void lcd_init_hw(void) {
+    // 48 MHz SPI (clk_peri = 96 MHz, min prescaler = 2)
+    spi_init(LCD_SPI, 48000000);
+    spi_set_format(LCD_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    gpio_set_function(LCD_SCK_PIN,  GPIO_FUNC_SPI);
+    gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
+
+    gpio_init(LCD_CS_PIN);  gpio_set_dir(LCD_CS_PIN,  GPIO_OUT); gpio_put(LCD_CS_PIN,  1);
+    gpio_init(LCD_DC_PIN);  gpio_set_dir(LCD_DC_PIN,  GPIO_OUT); gpio_put(LCD_DC_PIN,  1);
+    gpio_init(LCD_RST_PIN); gpio_set_dir(LCD_RST_PIN, GPIO_OUT); gpio_put(LCD_RST_PIN, 1);
+    gpio_init(LCD_BL_PIN);  gpio_set_dir(LCD_BL_PIN,  GPIO_OUT); gpio_put(LCD_BL_PIN,  0);
+
+    // Hardware reset
+    gpio_put(LCD_RST_PIN, 0); sleep_ms(10);
+    gpio_put(LCD_RST_PIN, 1); sleep_ms(120);
+
+    // Software reset
+    lcd_cmd(0x01); sleep_ms(150);
+
+    // Gamma set
+    lcd_cmd(0x26); lcd_data_byte(0x01);
+
+    // Positive gamma
+    lcd_cmd(0xE0);
+    static const uint8_t pgamma[] = {0xD0,0x00,0x02,0x07,0x0A,0x28,0x32,0x44,0x42,0x06,0x0E,0x12,0x14,0x17};
+    lcd_data(pgamma, sizeof(pgamma));
+
+    // Negative gamma
+    lcd_cmd(0xE1);
+    static const uint8_t ngamma[] = {0xD0,0x00,0x02,0x07,0x0A,0x28,0x31,0x54,0x47,0x0E,0x1C,0x17,0x1B,0x1E};
+    lcd_data(ngamma, sizeof(ngamma));
+
+    // Landscape mode needs row/column exchange on the ST7789.
+    lcd_cmd(0x36); lcd_data_byte(0xA0);
+
+    // Display inversion ON (required for correct colours on ST7789)
+    lcd_cmd(0x21);
+
+    // Pixel format: 16-bit RGB565
+    lcd_cmd(0x3A); lcd_data_byte(0x55);
+
+    // Frame rate: 75 Hz
+    lcd_cmd(0xB1); lcd_data_byte(0x00); lcd_data_byte(0x09);
+
+    // Sleep out then display on
+    lcd_cmd(0x11); sleep_ms(120);
+    lcd_cmd(0x29);
+
+    // In landscape mode the address window is 320x240.
+    lcd_cmd(0x2A);
+    static const uint8_t col[] = {0x00,0x00,0x01,0x3F};
+    lcd_data(col, sizeof(col));
+
+    // Page address 0-239
+    lcd_cmd(0x2B);
+    static const uint8_t page[] = {0x00,0x00,0x00,0xEF};
+    lcd_data(page, sizeof(page));
+
+    // Clear the panel before turning on the backlight.
+    {
+        lcd_cmd(0x2C);
+        gpio_put(LCD_DC_PIN, 1);
+        gpio_put(LCD_CS_PIN, 0);
+        static const uint8_t black2[2] = {0, 0};
+        for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
+            spi_write_blocking(LCD_SPI, black2, 2);
+        }
+        gpio_put(LCD_CS_PIN, 1);
+    }
+
+    // Set up SPI DMA channel
+    lcd_dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(lcd_dma_channel);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_dreq(&c, spi_get_dreq(LCD_SPI, true));
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+    dma_channel_configure(lcd_dma_channel, &c,
+                          &spi_get_hw(LCD_SPI)->dr,
+                          NULL, 0, false);
+
+    // Backlight on
+    gpio_put(LCD_BL_PIN, 1);
+}
+
+// Render overlays (status bar patches etc.) onto the line buffer for one scanline.
+static inline void render_overlays_for_scanline(uint16_t *dest, int scanline) {
+    if (display_video_type >= FIRST_VIDEO_TYPE_WITH_OVERLAYS) {
+        int prev = 0;
+        for (int vp = vpatchlists->vpatch_starters[scanline]; vp;) {
+            int next = vpatchlists->vpatch_next[vp];
+            while (vpatchlists->vpatch_next[prev] && vpatchlists->vpatch_next[prev] < vp) {
+                prev = vpatchlists->vpatch_next[prev];
+            }
+            vpatchlists->vpatch_next[vp] = vpatchlists->vpatch_next[prev];
+            vpatchlists->vpatch_next[prev] = vp;
+            prev = vp;
+            vp = next;
+        }
+        vpatchlist_t *overlays = vpatchlists->overlays[display_overlay_index];
+        prev = 0;
+        for (int vp = vpatchlists->vpatch_next[prev]; vp; vp = vpatchlists->vpatch_next[prev]) {
+            patch_t *patch = resolve_vpatch_handle(overlays[vp].entry.patch_handle);
+            int yoff = scanline - overlays[vp].entry.y;
+            if (yoff < vpatch_height(patch)) {
+                vpatchlists->vpatch_doff[vp] = draw_vpatch(dest, patch, &overlays[vp],
+                                                           vpatchlists->vpatch_doff[vp]);
+                prev = vp;
+            } else {
+                vpatchlists->vpatch_next[prev] = vpatchlists->vpatch_next[vp];
+            }
+        }
+    }
+}
+
+// Blit a fully-rendered game frame to the ST7789 via SPI DMA.
+// Double-buffered: while DMA sends line N the CPU converts line N+1.
+static void __scratch_x("lcd_blit") blit_frame_to_lcd(void) {
+#if USE_INTERP
+    need_save = interp_in_use;
+    interp_updated = 0;
+#endif
+
+    // Issue RAMWR and hold CS/DC for the full frame transfer
+    lcd_cmd(0x2C);
+    gpio_put(LCD_DC_PIN, 1);
+    gpio_put(LCD_CS_PIN, 0);
+
+    int cur = 0;
+#if PICOTRACKER_LCD_TEST_PATTERN
+    int nxt = 1 - cur;
+#endif
+
+#if PICOTRACKER_LCD_TEST_PATTERN
+    for (int y = 0; y < LCD_HEIGHT; ++y) {
+        fill_lcd_test_pattern_line((uint16_t *) lcd_line_buf[nxt], y);
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        cur = nxt;
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[cur], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+        nxt = 1 - cur;
+    }
+#elif PICOTRACKER_LCD_DEBUG_RAW_FB
+    memset(lcd_line_buf[cur], 0, SCREENWIDTH * 2);
+    for (int y = 0; y < LCD_LETTERBOX; y++) {
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[cur], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+    }
+
+    int nxt = 1 - cur;
+    fill_lcd_raw_framebuffer_line((uint16_t *) lcd_line_buf[nxt], 0);
+
+    for (int y = 0; y < SCREENHEIGHT; y++) {
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        cur = nxt;
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[cur], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+
+        nxt = 1 - cur;
+        if (y + 1 < SCREENHEIGHT) {
+            fill_lcd_raw_framebuffer_line((uint16_t *) lcd_line_buf[nxt], y + 1);
+        }
+    }
+
+    memset(lcd_line_buf[0], 0, SCREENWIDTH * 2);
+    for (int y = 0; y < LCD_LETTERBOX; y++) {
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[0], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+    }
+#else
+    // --- Top letterbox (black) ---
+    memset(lcd_line_buf[cur], 0, SCREENWIDTH * 2);
+    for (int y = 0; y < LCD_LETTERBOX; y++) {
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[cur], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+    }
+
+    // Pre-convert line 0 into the other buffer while DMA finishes last black line
+    int nxt = 1 - cur;
+    scanline_funcs[display_video_type](lcd_line_buf[nxt], 0);
+    render_overlays_for_scanline((uint16_t *)lcd_line_buf[nxt], 0);
+
+    // --- Game scanlines ---
+    for (int y = 0; y < SCREENHEIGHT; y++) {
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        cur = nxt;
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[cur], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+
+        nxt = 1 - cur;
+        if (y + 1 < SCREENHEIGHT) {
+            scanline_funcs[display_video_type](lcd_line_buf[nxt], y + 1);
+            render_overlays_for_scanline((uint16_t *)lcd_line_buf[nxt], y + 1);
+        }
+    }
+
+    // --- Bottom letterbox (black) ---
+    memset(lcd_line_buf[0], 0, SCREENWIDTH * 2);
+    for (int y = 0; y < LCD_LETTERBOX; y++) {
+        dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+        dma_channel_set_read_addr(lcd_dma_channel, lcd_line_buf[0], false);
+        dma_channel_set_trans_count(lcd_dma_channel, SCREENWIDTH * 2, true);
+    }
+#endif
+
+    dma_channel_wait_for_finish_blocking(lcd_dma_channel);
+    gpio_put(LCD_CS_PIN, 1);
+
+#if USE_INTERP
+    if (interp_updated && need_save) {
+        interp_restore_static(interp0, &interp0_save);
+        interp_restore_static(interp1, &interp1_save);
+    }
+#endif
+}
+
+static void core1_picotracker(void) {
+    lcd_init_hw();
+    sem_release(&core1_launch);
+
+    while (true) {
+        pd_core1_loop();
+
+        sem_acquire_blocking(&render_frame_ready);
+        display_video_type    = next_video_type;
+        display_frame_index   = next_frame_index;
+        display_overlay_index = next_overlay_index;
+#if !DEMO1_ONLY
+        video_scroll = next_video_scroll;
+#endif
+        sem_release(&display_frame_freed);
+
+        if (display_video_type != VIDEO_TYPE_SAVING) {
+            new_frame_init_overlays_palette_and_wipe();
+        }
+        blit_frame_to_lcd();
+    }
+}
+
+#endif // PICOTRACKER
+
+#if PICO_RP2350 && !PICOTRACKER
 #include "hardware/structs/accessctrl.h"
 #endif
 void I_InitGraphics(void)
@@ -1125,13 +1494,17 @@ void I_InitGraphics(void)
     sem_init(&display_frame_freed, 1, 2);
     sem_init(&core1_launch, 0, 1);
     pd_init();
+#if PICOTRACKER
+    multicore_launch_core1(core1_picotracker);
+#else
     multicore_launch_core1(core1);
+#endif
     // wait for core1 launch as it may do malloc and we have no mutex around that
     sem_acquire_blocking(&core1_launch);
 #if USE_ZONE_FOR_MALLOC
     disallow_core1_malloc = true;
 #endif
-#if PICO_RP2350
+#if PICO_RP2350 && !PICOTRACKER
     hw_set_bits(&accessctrl_hw->xip_ctrl, ACCESSCTRL_PASSWORD_BITS | 0xff);
 #endif
     initialized = true;
@@ -1387,6 +1760,7 @@ void I_DisplayFPSDots(boolean dots_on)
 }
 
 #if PICO_ON_DEVICE
+#if !PICOTRACKER
 bool video_doom_adapt_for_mode(const struct scanvideo_pio_program *program, const struct scanvideo_mode *mode,
                                struct scanvideo_scanline_buffer *missing_scanvideo_scanline_buffer, uint16_t *modifiable_instructions) {
     missing_scanvideo_scanline_buffer->data = missing_scanline_data;
@@ -1399,6 +1773,7 @@ pio_sm_config video_doom_configure_pio(pio_hw_t *pio, uint sm, uint offset) {
     scanvideo_default_configure_pio(pio, sm, offset, &config, false);
     return config;
 }
+#endif
 #else
 void simulate_video_pio_video_doom(const uint32_t *dma_data, uint32_t dma_data_size,
                                    uint16_t *pixel_buffer, int32_t max_pixels, int32_t expected_width, bool overlay) {

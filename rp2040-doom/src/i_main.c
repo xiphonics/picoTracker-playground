@@ -43,6 +43,7 @@
 #if PICO_RP2350
 #include "hardware/structs/qmi.h"
 #endif
+
 //
 // D_DoomMain()
 // Not a globally visible function, just included for source reference,
@@ -53,7 +54,9 @@ void D_DoomMain (void);
 
 #if PICO_ON_DEVICE
 #include "pico/binary_info.h"
+#if defined(PICO_AUDIO_I2S_DATA_PIN) && defined(PICO_AUDIO_I2S_CLOCK_PIN_BASE)
 bi_decl(bi_3pins_with_names(PICO_AUDIO_I2S_DATA_PIN, "I2S DIN", PICO_AUDIO_I2S_CLOCK_PIN_BASE, "I2S BCK", PICO_AUDIO_I2S_CLOCK_PIN_BASE+1, "I2S LRCK"));
+#endif
 #endif
 
 int main(int argc, char **argv)
@@ -74,22 +77,34 @@ int main(int argc, char **argv)
             QMI_M0_TIMING_CLKDIV_BITS | QMI_M0_TIMING_RXDELAY_BITS
     );
 #endif
+    // picoTracker bring-up: avoid forcing a high core voltage while testing
+    // conservative clocks, and don't apply Pico board SMPS assumptions.
+#if !PICOTRACKER
     vreg_set_voltage(VREG_VOLTAGE_1_30);
     busy_wait_us(1000);
+#endif
     // todo pause? is this the cause of the cold start issue?
+#if PICOTRACKER
+    // picoTracker uses the SDK runtime clock init from SYS_CLK_HZ.
+#else
     set_sys_clock_khz(270000, true);
+#endif
 #if !USE_PICO_NET
     // debug ?
 //    gpio_debug_pins_init();
 #endif
 #ifdef PICO_SMPS_MODE_PIN
+#if !PICOTRACKER
     gpio_init(PICO_SMPS_MODE_PIN);
     gpio_set_dir(PICO_SMPS_MODE_PIN, GPIO_OUT);
     gpio_put(PICO_SMPS_MODE_PIN, 1);
 #endif
 #endif
+#endif
 #if LIB_PICO_STDIO
+#if !PICOTRACKER
     stdio_init_all();
+#endif
 #endif
 #if PICO_BUILD
     I_Init();
@@ -115,9 +130,7 @@ int main(int argc, char **argv)
     #endif
 
     // start doom
-
     D_DoomMain ();
 
     return 0;
 }
-

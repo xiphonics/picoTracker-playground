@@ -78,6 +78,12 @@ static struct audio_buffer_format producer_format = {
         .sample_stride = 4
 };
 
+#if PICOTRACKER
+#define PICO_SOUND_BUFFER_COUNT 4
+#else
+#define PICO_SOUND_BUFFER_COUNT 2
+#endif
+
 // ====== FROM ADPCM-LIB =====
 #define CLIP(data, min, max) \
 if ((data) > (max)) data = max; \
@@ -331,11 +337,11 @@ static void I_Pico_UpdateSound(void)
 {
     if (!sound_initialized) return;
 
-    // todo note this is called from D_Main around the game loop, which is fast enough now but may not be.
-    //  we can either poll more frequently, or use IRQ but then we have to be careful with threading (both OPL and channels)
-    // todo hopefully at least we can run the AI fast enough.
-    audio_buffer_t *buffer = take_audio_buffer(producer_pool, false);
-    if (buffer) {
+    // This is polled from the main loop, so one late frame can free multiple
+    // audio buffers. Drain all currently-available producer slots so we can
+    // catch back up after transient render/input spikes.
+    audio_buffer_t *buffer;
+    while ((buffer = take_audio_buffer(producer_pool, false)) != NULL) {
         if (music_generator) {
             // todo think about volume; this already has a (<< 3) in it
             music_generator(buffer);
@@ -420,8 +426,7 @@ static boolean I_Pico_InitSound(boolean _use_sfx_prefix)
     int i;
     use_sfx_prefix = _use_sfx_prefix;
 
-    // todo this will likely need adjustment - maybe with IRQs/double buffer & pull from audio we can make it quite small
-    producer_pool = audio_new_producer_pool(&producer_format, 2, 1024); // todo correct size
+    producer_pool = audio_new_producer_pool(&producer_format, PICO_SOUND_BUFFER_COUNT, 1024); // todo correct size
 
     struct audio_i2s_config config = {
             .data_pin = PICO_AUDIO_I2S_DATA_PIN,

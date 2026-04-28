@@ -75,15 +75,17 @@ static wad_file_t *W_Memory_OpenFile(const char *path)
 #if WHD_SUPER_TINY
     if (fileo.mapped[0] != 'I' || fileo.mapped[1] != 'W' || fileo.mapped[2] != 'H' || fileo.mapped[3] != 'X') {
 #if PICO_ON_DEVICE
-        panic("No WXD at %p\n", TINY_WAD_ADDR);
+        panic("No WHX at %p: %02x %02x %02x %02x\n", TINY_WAD_ADDR,
+              fileo.mapped[0], fileo.mapped[1], fileo.mapped[2], fileo.mapped[3]);
 #else
-        panic("Expected WXD format");
+        panic("Expected WHX format");
 #endif
     }
 #else
     if (fileo.mapped[0] != 'I' || fileo.mapped[1] != 'W' || fileo.mapped[2] != 'H' || fileo.mapped[3] != 'D') {
 #if PICO_ON_DEVICE
-        panic("No WHD at %p\n", TINY_WAD_ADDR);
+        panic("No WHD at %p: %02x %02x %02x %02x\n", TINY_WAD_ADDR,
+              fileo.mapped[0], fileo.mapped[1], fileo.mapped[2], fileo.mapped[3]);
 #else
         panic("Expected WHD format");
 #endif

@@ -85,6 +85,8 @@
 #include "tusb.h"
 #endif
 #endif
+
+
 //
 // D-DoomLoop()
 // Not a globally visible function,
@@ -1345,9 +1347,7 @@ void D_DoomMain (void)
 #endif
 
     // print banner
-
     I_PrintBanner(PACKAGE_STRING);
-
     DEH_printf("Z_Init: Init zone memory allocation daemon. \n");
     Z_Init ();
 
@@ -2125,4 +2125,3 @@ void D_DoomMain (void)
 
     D_DoomLoop ();  // never returns
 }
-

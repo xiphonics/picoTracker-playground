@@ -5,10 +5,10 @@
  */
 #pragma once
 #include "wad.h"
+#include <cstdint>
 #include <vector>
 #include "statsomizer.h"
 
 extern statsomizer musx_decoder_space;
 
 std::vector<uint8_t> compress_mus(std::pair<const int, lump> &e);
-

@@ -511,6 +511,113 @@ static void pico_quit(void) {
 }
 #endif
 
+#if PICOTRACKER
+// ============================================================
+// picoTracker GPIO button scanning
+// Buttons are on GPIO 8-16, active-low with internal pull-ups.
+// gpio_get_all() gives: bits 16:8 → buttons (inverted, masked, shifted).
+// Mask = (gpio_get_all() & 0x0001FF00) >> 8   (bits 16..8)
+//
+// Bit layout after shift:
+//   bit 0 = GPIO 8  = LEFT
+//   bit 1 = GPIO 9  = DOWN
+//   bit 2 = GPIO 10 = RIGHT
+//   bit 3 = GPIO 11 = UP
+//   bit 4 = GPIO 12 = ALT
+//   bit 5 = GPIO 13 = EDIT
+//   bit 6 = GPIO 14 = ENTER
+//   bit 7 = GPIO 15 = NAV
+//   bit 8 = GPIO 16 = PLAY
+//
+// Doom key mapping:
+//   LEFT   → KEY_LEFTARROW  (turn left)
+//   RIGHT  → KEY_RIGHTARROW (turn right)
+//   UP     → KEY_UPARROW    (move forward)
+//   DOWN   → KEY_DOWNARROW  (move backward)
+//   ALT    → ' '            (use / open)
+//   EDIT   → KEY_RSHIFT     (run)
+//   ENTER  → KEY_ENTER      (menu select / confirm) and KEY_RCTRL in-game
+//   NAV    → KEY_TAB        (auto-map)
+//   PLAY   → KEY_ESCAPE     (pause / menu)
+// ============================================================
+
+#include "hardware/gpio.h"
+
+// GPIO first button pin and count
+#define PT_BTN_GPIO_BASE  8
+#define PT_BTN_COUNT      9
+
+// Bit positions after the shift
+#define PT_BIT_LEFT   (1u << 0)
+#define PT_BIT_DOWN   (1u << 1)
+#define PT_BIT_RIGHT  (1u << 2)
+#define PT_BIT_UP     (1u << 3)
+#define PT_BIT_ALT    (1u << 4)
+#define PT_BIT_EDIT   (1u << 5)
+#define PT_BIT_ENTER  (1u << 6)
+#define PT_BIT_NAV    (1u << 7)
+#define PT_BIT_PLAY   (1u << 8)
+
+struct { uint32_t bit; int doomkey; } pt_keymap[] = {
+    { PT_BIT_LEFT,  KEY_LEFTARROW  },
+    { PT_BIT_RIGHT, KEY_RIGHTARROW },
+    { PT_BIT_UP,    KEY_UPARROW    },
+    { PT_BIT_DOWN,  KEY_DOWNARROW  },
+    { PT_BIT_ALT,   ' '            },  // use / open
+    { PT_BIT_EDIT,  KEY_RSHIFT     },  // run
+    { PT_BIT_ENTER, KEY_ENTER      },  // menu select / confirm
+    { PT_BIT_NAV,   KEY_TAB        },  // automap
+    { PT_BIT_PLAY,  KEY_ESCAPE     },  // pause / menu
+};
+
+static uint32_t prev_buttons = 0;
+
+static uint32_t read_buttons(void) {
+    // Active-low: invert and mask bits 16:8, then shift to 8:0
+    return (~gpio_get_all() & 0x0001FF00u) >> 8;
+}
+
+void I_InputInit(void) {
+    for (int i = 0; i < PT_BTN_COUNT; i++) {
+        gpio_init(PT_BTN_GPIO_BASE + i);
+        gpio_set_dir(PT_BTN_GPIO_BASE + i, GPIO_IN);
+        gpio_pull_up(PT_BTN_GPIO_BASE + i);
+    }
+    prev_buttons = 0;
+}
+
+void I_GetEvent(void) {
+    uint32_t cur = read_buttons();
+    uint32_t changed = cur ^ prev_buttons;
+    prev_buttons = cur;
+
+    event_t ev;
+    for (int i = 0; i < (int)count_of(pt_keymap); i++) {
+        uint32_t bit = pt_keymap[i].bit;
+        if (!(changed & bit)) continue;
+        ev.type   = (cur & bit) ? ev_keydown : ev_keyup;
+        ev.data1  = pt_keymap[i].doomkey;
+        ev.data2  = ev.type == ev_keydown ? pt_keymap[i].doomkey : 0;
+        ev.data3  = 0;
+        D_PostEvent(&ev);
+
+        // Doom uses Ctrl for fire in-game but Enter for menu confirm.
+        // Mirror ENTER to Ctrl so one physical button covers both roles.
+        if (bit == PT_BIT_ENTER) {
+            ev.data1 = KEY_RCTRL;
+            ev.data2 = ev.type == ev_keydown ? KEY_RCTRL : 0;
+            D_PostEvent(&ev);
+        }
+    }
+}
+
+void I_GetEventTimeout(int key_timeout) {
+    (void)key_timeout;
+    I_GetEvent();
+}
+
+#else // !PICOTRACKER — original USB/UART keyboard code
+
 void I_InputInit(void) {
 #if PICO_NO_HARDWARE
     platform_key_down = pico_key_down;
@@ -529,6 +636,9 @@ void I_GetEvent() {
     return I_GetEventTimeout(50);
 }
 
+#endif // PICOTRACKER
+
+#if !PICOTRACKER
 void I_GetEventTimeout(int key_timeout) {
 #if PICO_ON_DEVICE && !NO_USE_UART
     if (uart_is_readable(uart_default)) {
@@ -575,6 +685,7 @@ void I_GetEventTimeout(int key_timeout) {
     }
 #endif
 }
+#endif // !PICOTRACKER
 
 #if USB_SUPPORT
 

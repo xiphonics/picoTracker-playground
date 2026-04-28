@@ -502,7 +502,6 @@ function(add_doom_tiny SUFFIX RENDER_LIB)
         # SDK minimilization
         PICO_TIME_DEFAULT_ALARM_POOL_DISABLED=1
         PICO_TIME_DEFAULT_ALARM_POOL_MAX_TIMERS=1
-        PICO_DISABLE_SHARED_IRQ_HANDLERS=1
         PICO_USE_OPTIMISTIC_SBRK=1
 
         # MUSIC
@@ -510,7 +509,7 @@ function(add_doom_tiny SUFFIX RENDER_LIB)
         USE_DIRECT_MIDI_LUMP=1
 
         NO_USE_NET=1 # standard networking
-        USE_PICO_NET=1
+        USE_PICO_NET=0
         # for vgaboard
         PICO_DEFAULT_I2C=1
         PICO_DEFAULT_I2C_SDA_PIN=18
@@ -660,6 +659,30 @@ if (PICO_SDK)
                 TINY_WAD_ADDR=0x10048000
                 )
     endif()
+
+    # ---------------------------------------------------------------
+    # picoTracker target — ST7789 SPI display, GPIO buttons
+    # ---------------------------------------------------------------
+    add_doom_tiny(_picotracker render_newhope)
+    target_compile_definitions(doom_tiny_picotracker PRIVATE
+            PICOTRACKER=1
+            TINY_WAD_ADDR=0x10048000
+            # I2S pins for picoTracker
+            PICO_AUDIO_I2S_DATA_PIN=17
+            PICO_AUDIO_I2S_CLOCK_PIN_BASE=18
+            # Disable UART (pin 0/1 used for MIDI on picoTracker)
+            NO_USE_UART=1
+            # picoTracker board clock: 220.5 MHz for exact 44.1 kHz I2S division.
+            PLL_SYS_REFDIV=2
+            PLL_SYS_VCO_FREQ_HZ=882000000
+            PLL_SYS_POSTDIV1=4
+            PLL_SYS_POSTDIV2=1
+            SYS_CLK_HZ=220500000
+    )
+    # add_doom_tiny sets USE_PICO_NET=1; undefine it cleanly then set to 0
+    # (I2C pins for picoNet clash with I2S pins on picoTracker)
+    target_compile_options(doom_tiny_picotracker PRIVATE -UUSE_PICO_NET -DUSE_PICO_NET=0)
+    # Bring in SPI/DMA/PWM/clocks needed for the ST7789 display driver
+    target_link_libraries(doom_tiny_picotracker PRIVATE common_pico_picotracker)
+    pico_enable_stdio_uart(doom_tiny_picotracker 0)
 endif()
-
-
